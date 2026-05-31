@@ -9,6 +9,7 @@ from pathlib import Path
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
+from aiogram.enums import ParseMode
 from aiogram.types import Message
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -114,8 +115,10 @@ async def cmd_start(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Этот бот используется для авторизации на Minecraft-сервере.\n"
-            "Зайдите на сервер и перейдите по ссылке, которую он выдаст."
+            "🎮 <b>Авторизация Minecraft</b>\n\n"
+            "Зайдите на сервер — в чате появится ссылка для привязки аккаунта.\n\n"
+            "<i>Один Telegram = один игровой аккаунт.</i>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -130,14 +133,23 @@ async def cmd_start(message: Message) -> None:
         ).fetchone()
 
         if not pending:
-            await message.answer("Код не найден или уже использован. Зайдите на сервер заново.")
+            await message.answer(
+                "❌ <b>Код не найден</b>\n\n"
+                "Возможно, он уже использован или введён неверно.\n"
+                "Зайдите на сервер заново — получите новый код.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         mc_uuid, mc_name, expires_at = pending
         if datetime.fromisoformat(expires_at) < utcnow():
             conn.execute("DELETE FROM pending_codes WHERE code = ?", (code,))
             conn.commit()
-            await message.answer("Код истёк. Зайдите на сервер — вы получите новый.")
+            await message.answer(
+                "⏰ <b>Код истёк</b>\n\n"
+                "Зайдите на сервер снова — вам выдадут новый код.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         existing_tg = conn.execute(
@@ -146,8 +158,10 @@ async def cmd_start(message: Message) -> None:
         ).fetchone()
         if existing_tg and existing_tg[0] != mc_name:
             await message.answer(
-                f"Этот Telegram уже привязан к аккаунту <b>{existing_tg[0]}</b>.\n"
-                "Один Telegram = один Minecraft-аккаунт."
+                "🚫 <b>Привязка недоступна</b>\n\n"
+                f"Ваш Telegram уже привязан к аккаунту <code>{existing_tg[0]}</code>.\n\n"
+                "<i>Один Telegram — один Minecraft-аккаунт.</i>",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -156,7 +170,11 @@ async def cmd_start(message: Message) -> None:
             (mc_uuid,),
         ).fetchone()
         if existing_uuid and existing_uuid[0] != telegram_id:
-            await message.answer("Этот Minecraft-аккаунт уже привязан к другому Telegram.")
+            await message.answer(
+                "🚫 <b>Привязка недоступна</b>\n\n"
+                f"Аккаунт <code>{mc_name}</code> уже привязан к другому Telegram.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         conn.execute(
@@ -170,8 +188,12 @@ async def cmd_start(message: Message) -> None:
         conn.commit()
 
     await message.answer(
-        f"Готово! Аккаунт <b>{mc_name}</b> привязан.\n"
-        "Вернитесь в Minecraft — вас должно разморозить автоматически."
+        "✅ <b>Авторизация успешна!</b>\n\n"
+        f"🎮 Игрок: <code>{mc_name}</code>\n"
+        f"📱 Telegram: {message.from_user.full_name}\n\n"
+        "Вернитесь в Minecraft — доступ откроется автоматически.\n"
+        "Приятной игры! ⛏️",
+        parse_mode=ParseMode.HTML,
     )
     log.info("Linked %s (%s) to telegram %s", mc_name, mc_uuid, telegram_id)
 
