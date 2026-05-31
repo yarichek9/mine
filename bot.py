@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.enums import ParseMode
 from aiogram.types import Message
@@ -21,6 +22,8 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
 PORT = int(os.environ.get("PORT", "8080"))
 DB_PATH = Path(os.environ.get("DATABASE_PATH", "auth.db"))
 CODE_TTL_MINUTES = int(os.environ.get("CODE_TTL_MINUTES", "10"))
+
+CODE_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{4,8}$")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -107,22 +110,11 @@ async def api_health(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-@dp.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def process_auth_code(message: Message, code: str) -> None:
     if not message.from_user:
         return
 
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer(
-            "🎮 <b>Авторизация Minecraft</b>\n\n"
-            "Зайдите на сервер — в чате появится ссылка для привязки аккаунта.\n\n"
-            "<i>Один Telegram = один игровой аккаунт.</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    code = parts[1].upper().strip()
+    code = code.upper().strip()
     telegram_id = message.from_user.id
     now = utcnow().isoformat()
 
@@ -135,8 +127,8 @@ async def cmd_start(message: Message) -> None:
         if not pending:
             await message.answer(
                 "❌ <b>Код не найден</b>\n\n"
-                "Возможно, он уже использован или введён неверно.\n"
-                "Зайдите на сервер заново — получите новый код.",
+                "Такого кода нет — возможно, он уже использован или введён неверно.\n"
+                "Зайдите на сервер заново и получите новый код.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -196,6 +188,33 @@ async def cmd_start(message: Message) -> None:
         parse_mode=ParseMode.HTML,
     )
     log.info("Linked %s (%s) to telegram %s", mc_name, mc_uuid, telegram_id)
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "🎮 <b>Авторизация Minecraft</b>\n\n"
+            "Зайдите на сервер — в чате появится ссылка или код для привязки.\n"
+            "Отправьте код сюда в чат или нажмите ссылку из игры.\n\n"
+            "<i>Один Telegram = один игровой аккаунт.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await process_auth_code(message, parts[1])
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_plain_code(message: Message) -> None:
+    code = (message.text or "").strip().upper()
+    if not CODE_PATTERN.match(code):
+        return
+    await process_auth_code(message, code)
 
 
 async def start_web(app: web.Application) -> None:
