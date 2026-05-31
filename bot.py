@@ -41,6 +41,8 @@ def init_db() -> None:
                 minecraft_uuid TEXT PRIMARY KEY,
                 minecraft_name TEXT NOT NULL,
                 telegram_id INTEGER NOT NULL UNIQUE,
+                telegram_username TEXT,
+                telegram_name TEXT,
                 linked_at TEXT NOT NULL
             );
 
@@ -54,7 +56,16 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_pending_uuid ON pending_codes(minecraft_uuid);
             """
         )
+        migrate_db(conn)
         conn.commit()
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "telegram_username" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN telegram_username TEXT")
+    if "telegram_name" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN telegram_name TEXT")
 
 
 def json_secret_ok(data: dict) -> bool:
@@ -116,6 +127,8 @@ async def process_auth_code(message: Message, code: str) -> None:
 
     code = code.upper().strip()
     telegram_id = message.from_user.id
+    telegram_username = message.from_user.username
+    telegram_name = message.from_user.full_name
     now = utcnow().isoformat()
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -170,24 +183,32 @@ async def process_auth_code(message: Message, code: str) -> None:
             return
 
         conn.execute(
-            "INSERT INTO links (minecraft_uuid, minecraft_name, telegram_id, linked_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO links (minecraft_uuid, minecraft_name, telegram_id, telegram_username, telegram_name, linked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
-            "minecraft_name=excluded.minecraft_name, telegram_id=excluded.telegram_id, linked_at=excluded.linked_at",
-            (mc_uuid, mc_name, telegram_id, now),
+            "minecraft_name=excluded.minecraft_name, "
+            "telegram_id=excluded.telegram_id, "
+            "telegram_username=excluded.telegram_username, "
+            "telegram_name=excluded.telegram_name, "
+            "linked_at=excluded.linked_at",
+            (mc_uuid, mc_name, telegram_id, telegram_username, telegram_name, now),
         )
         conn.execute("DELETE FROM pending_codes WHERE code = ?", (code,))
         conn.commit()
 
+    tg_label = f"@{telegram_username}" if telegram_username else telegram_name
     await message.answer(
         "✅ <b>Авторизация успешна!</b>\n\n"
         f"🎮 Игрок: <code>{mc_name}</code>\n"
-        f"📱 Telegram: {message.from_user.full_name}\n\n"
+        f"📱 Telegram: {tg_label}\n\n"
         "Вернитесь в Minecraft — доступ откроется автоматически.\n"
         "Приятной игры! ⛏️",
         parse_mode=ParseMode.HTML,
     )
-    log.info("Linked %s (%s) to telegram %s", mc_name, mc_uuid, telegram_id)
+    log.info(
+        "Linked %s (%s) to telegram %s (@%s)",
+        mc_name, mc_uuid, telegram_id, telegram_username or "-",
+    )
 
 
 @dp.message(CommandStart())
