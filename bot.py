@@ -22,6 +22,7 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
 PORT = int(os.environ.get("PORT", "8080"))
 DB_PATH = Path(os.environ.get("DATABASE_PATH", "auth.db"))
 CODE_TTL_MINUTES = int(os.environ.get("CODE_TTL_MINUTES", "10"))
+LOGIN_CODE_TTL_MINUTES = int(os.environ.get("LOGIN_CODE_TTL_MINUTES", "5"))
 
 CODE_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{4,8}$")
 
@@ -53,6 +54,12 @@ def init_db() -> None:
                 expires_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS login_codes (
+                minecraft_uuid TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pending_uuid ON pending_codes(minecraft_uuid);
             """
         )
@@ -66,6 +73,23 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE links ADD COLUMN telegram_username TEXT")
     if "telegram_name" not in cols:
         conn.execute("ALTER TABLE links ADD COLUMN telegram_name TEXT")
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "login_codes" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE login_codes (
+                minecraft_uuid TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def json_secret_ok(data: dict) -> bool:
@@ -119,6 +143,100 @@ async def api_session(request: web.Request) -> web.Response:
 
 async def api_health(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
+
+
+async def api_login_session(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    if not json_secret_ok(data):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    uuid = str(data.get("uuid", "")).lower()
+    name = str(data.get("name", ""))[:16]
+    code = str(data.get("code", "")).strip()
+
+    if not uuid or not name or not code:
+        return web.json_response({"error": "missing fields"}, status=400)
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT telegram_id FROM links WHERE minecraft_uuid = ?",
+            (uuid,),
+        ).fetchone()
+
+    if not row:
+        return web.json_response({"ok": False, "error": "not_linked"}, status=404)
+
+    telegram_id = row[0]
+    expires_at = (utcnow() + timedelta(minutes=LOGIN_CODE_TTL_MINUTES)).isoformat()
+
+    try:
+        await bot.send_message(
+            telegram_id,
+            "🔐 <b>Код входа на сервер</b>\n\n"
+            f"🎮 Игрок: <code>{name}</code>\n"
+            f"🔢 Код: <code>{code}</code>\n\n"
+            "Введите этот код в <b>чат Minecraft</b>.\n"
+            f"<i>Действует {LOGIN_CODE_TTL_MINUTES} мин.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        log.error("Failed to send login code to %s: %s", telegram_id, exc)
+        return web.json_response({"ok": False, "error": "send_failed"}, status=502)
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO login_codes (minecraft_uuid, code, expires_at) "
+            "VALUES (?, ?, ?)",
+            (uuid, code, expires_at),
+        )
+        conn.commit()
+
+    log.info("Login code %s for %s (%s) -> telegram %s", code, name, uuid, telegram_id)
+    return web.json_response({"ok": True})
+
+
+async def api_login_verify(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    if not json_secret_ok(data):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    uuid = str(data.get("uuid", "")).lower()
+    code = str(data.get("code", "")).strip()
+
+    if not uuid or not code:
+        return web.json_response({"error": "missing fields"}, status=400)
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT code, expires_at FROM login_codes WHERE minecraft_uuid = ?",
+            (uuid,),
+        ).fetchone()
+
+        if not row:
+            return web.json_response({"ok": False, "error": "no_code"})
+
+        expected, expires_at = row
+        if datetime.fromisoformat(expires_at) < utcnow():
+            conn.execute("DELETE FROM login_codes WHERE minecraft_uuid = ?", (uuid,))
+            conn.commit()
+            return web.json_response({"ok": False, "error": "expired"})
+
+        if code != expected:
+            return web.json_response({"ok": False, "error": "wrong"})
+
+        conn.execute("DELETE FROM login_codes WHERE minecraft_uuid = ?", (uuid,))
+        conn.commit()
+
+    log.info("Login verified for %s", uuid)
+    return web.json_response({"ok": True})
 
 
 async def process_auth_code(message: Message, code: str) -> None:
@@ -256,6 +374,8 @@ async def main() -> None:
     app.router.add_get("/health", api_health)
     app.router.add_get("/api/check/{uuid}", api_check)
     app.router.add_post("/api/session", api_session)
+    app.router.add_post("/api/login-session", api_login_session)
+    app.router.add_post("/api/login-verify", api_login_verify)
 
     await start_web(app)
 
