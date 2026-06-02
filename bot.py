@@ -37,6 +37,7 @@ LOGIN_CODE_TTL_MINUTES = int(os.environ.get("LOGIN_CODE_TTL_MINUTES", "5"))
 CODE_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{4,8}$")
 ALLOWED_SKIN_SIZES = {(64, 32), (64, 64), (128, 64), (128, 128)}
 SKIN_BUTTON_TEXT = "🎨 Сменить скин"
+PREV_SKIN_BUTTON_TEXT = "↩️ Предыдущий скин"
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -127,6 +128,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         skin_cols = {row[1] for row in conn.execute("PRAGMA table_info(custom_skins)")}
         if "skin_rgba_base64" not in skin_cols:
             conn.execute("ALTER TABLE custom_skins ADD COLUMN skin_rgba_base64 TEXT")
+        if "prev_skin_png_base64" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_skin_png_base64 TEXT")
+        if "prev_skin_rgba_base64" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_skin_rgba_base64 TEXT")
 
 
 def json_secret_ok(data: dict) -> bool:
@@ -362,7 +367,10 @@ async def api_unlink(request: web.Request) -> web.Response:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=SKIN_BUTTON_TEXT)]],
+        keyboard=[
+            [KeyboardButton(text=SKIN_BUTTON_TEXT)],
+            [KeyboardButton(text=PREV_SKIN_BUTTON_TEXT)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -373,6 +381,7 @@ async def setup_bot_commands() -> None:
         [
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="skin", description="Сменить скин Minecraft"),
+            BotCommand(command="prevskin", description="Вернуть предыдущий скин"),
         ]
     )
 
@@ -436,6 +445,54 @@ def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str], Op
     return png_b64, rgba_b64, None
 
 
+def save_custom_skin(
+    conn: sqlite3.Connection,
+    mc_uuid: str,
+    mc_name: str,
+    telegram_id: int,
+    png_b64: str,
+    rgba_b64: str,
+) -> int:
+    updated_ms = int(time.time() * 1000)
+    conn.execute(
+        "INSERT INTO custom_skins ("
+        "minecraft_uuid, minecraft_name, telegram_id, "
+        "skin_png_base64, skin_rgba_base64, updated_ms"
+        ") VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
+        "minecraft_name=excluded.minecraft_name, "
+        "telegram_id=excluded.telegram_id, "
+        "prev_skin_png_base64=custom_skins.skin_png_base64, "
+        "prev_skin_rgba_base64=custom_skins.skin_rgba_base64, "
+        "skin_png_base64=excluded.skin_png_base64, "
+        "skin_rgba_base64=excluded.skin_rgba_base64, "
+        "updated_ms=excluded.updated_ms",
+        (mc_uuid, mc_name, telegram_id, png_b64, rgba_b64, updated_ms),
+    )
+    return updated_ms
+
+
+def restore_previous_skin(conn: sqlite3.Connection, mc_uuid: str) -> Tuple[Optional[int], Optional[str]]:
+    row = conn.execute(
+        "SELECT prev_skin_png_base64, prev_skin_rgba_base64, "
+        "skin_png_base64, skin_rgba_base64 "
+        "FROM custom_skins WHERE minecraft_uuid = ?",
+        (mc_uuid,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None, "Нет сохранённого предыдущего скина."
+    prev_png, prev_rgba, cur_png, cur_rgba = row
+    updated_ms = int(time.time() * 1000)
+    conn.execute(
+        "UPDATE custom_skins SET "
+        "skin_png_base64=?, skin_rgba_base64=?, "
+        "prev_skin_png_base64=?, prev_skin_rgba_base64=?, updated_ms=? "
+        "WHERE minecraft_uuid=?",
+        (prev_png, prev_rgba, cur_png, cur_rgba, updated_ms, mc_uuid),
+    )
+    return updated_ms, None
+
+
 async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
     if not message.from_user:
         return
@@ -447,9 +504,6 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
         return
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        if not is_skin_wait(conn, telegram_id):
-            return
-
         link = get_link_by_telegram(conn, telegram_id)
         if not link:
             clear_skin_wait(conn, telegram_id)
@@ -461,18 +515,7 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
             return
 
         mc_uuid, mc_name = link
-        updated_ms = int(time.time() * 1000)
-        conn.execute(
-            "INSERT INTO custom_skins (minecraft_uuid, minecraft_name, telegram_id, skin_png_base64, skin_rgba_base64, updated_ms) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
-            "minecraft_name=excluded.minecraft_name, "
-            "telegram_id=excluded.telegram_id, "
-            "skin_png_base64=excluded.skin_png_base64, "
-            "skin_rgba_base64=excluded.skin_rgba_base64, "
-            "updated_ms=excluded.updated_ms",
-            (mc_uuid, mc_name, telegram_id, png_b64, rgba_b64, updated_ms),
-        )
+        save_custom_skin(conn, mc_uuid, mc_name, telegram_id, png_b64, rgba_b64)
         clear_skin_wait(conn, telegram_id)
         conn.commit()
 
@@ -544,13 +587,9 @@ async def start_skin_upload(message: Message) -> None:
     await message.answer(
         "🎨 <b>Смена скина</b>\n\n"
         f"🎮 Аккаунт: <code>{mc_name}</code>\n\n"
-        "Отправьте <b>PNG-файл</b> скина как <b>документ</b> (скрепка → Файл → .png).\n"
-        "<b>Не отправляйте как фото</b> — Telegram сжимает картинку.\n\n"
-        "Размер: <code>64×64</code> (лучше) или <code>64×32</code>.\n"
-        "Нужен шаблон <b>Minecraft Bedrock</b>, не Java с NameMC.\n"
-        "Тип рук должен совпадать с персонажем в игре:\n"
-        "• <b>Steve</b> — широкие руки\n"
-        "• <b>Alex</b> — узкие (slim) руки",
+        "Отправьте <b>PNG</b> как <b>документ</b> (скрепка → Файл).\n"
+        "<b>Не как фото</b> — Telegram сжимает картинку.\n\n"
+        "<i>Можно отправить PNG в любой момент — кнопку нажимать не обязательно.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(),
     )
@@ -566,19 +605,61 @@ async def on_skin_button_text(message: Message) -> None:
     await start_skin_upload(message)
 
 
+async def apply_previous_skin(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    telegram_id = message.from_user.id
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        link = get_link_by_telegram(conn, telegram_id)
+        if not link:
+            await message.answer(
+                "❌ <b>Аккаунт не привязан</b>\n\nСначала авторизуйтесь на сервере.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        mc_uuid, mc_name = link
+        _updated_ms, error = restore_previous_skin(conn, mc_uuid)
+        if error:
+            await message.answer(f"❌ {error}", parse_mode=ParseMode.HTML)
+            return
+        conn.commit()
+
+    await message.answer(
+        "✅ <b>Предыдущий скин восстановлен!</b>\n\n"
+        f"🎮 Игрок: <code>{mc_name}</code>\n"
+        "Если вы на сервере — скин обновится через несколько секунд.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+    log.info("Previous skin restored for %s (%s) via telegram %s", mc_name, mc_uuid, telegram_id)
+
+
+@dp.message(F.text == PREV_SKIN_BUTTON_TEXT)
+async def on_prev_skin_button(message: Message) -> None:
+    await apply_previous_skin(message)
+
+
+@dp.message(Command("prevskin"))
+async def cmd_prevskin(message: Message) -> None:
+    await apply_previous_skin(message)
+
+
 @dp.message(F.photo)
 async def on_photo(message: Message) -> None:
     if not message.from_user:
         return
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        if not is_skin_wait(conn, message.from_user.id):
-            return
+        link = get_link_by_telegram(conn, message.from_user.id)
+    if not link:
+        return
 
     await message.answer(
         "❌ <b>Не отправляйте скин как фото</b>\n\n"
-        "Telegram сжимает фото и текстура ломается.\n"
-        "Отправьте PNG как <b>документ</b>: скрепка → Файл → выберите .png",
+        "Telegram сжимает фото.\n"
+        "Отправьте PNG как <b>документ</b>: скрепка → Файл → .png",
         parse_mode=ParseMode.HTML,
     )
 
@@ -589,8 +670,9 @@ async def on_document(message: Message) -> None:
         return
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        if not is_skin_wait(conn, message.from_user.id):
-            return
+        link = get_link_by_telegram(conn, message.from_user.id)
+    if not link:
+        return
 
     document = message.document
     file_name = (document.file_name or "").lower()
