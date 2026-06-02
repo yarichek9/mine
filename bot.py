@@ -429,11 +429,6 @@ def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str], Op
         allowed = ", ".join(f"{w}x{h}" for w, h in sorted(ALLOWED_SKIN_SIZES))
         return None, None, f"Неверный размер {width}x{height}. Нужен один из: {allowed}."
 
-    if (width, height) == (64, 32):
-        canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        canvas.paste(image, (0, 0))
-        image = canvas
-
     rgba_b64 = base64.b64encode(png_to_legacy_rgba(image)).decode("ascii")
     output = io.BytesIO()
     image.save(output, format="PNG")
