@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 import logging
 import os
 import re
@@ -239,6 +240,90 @@ async def api_login_verify(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _find_link(conn: sqlite3.Connection, name: Optional[str], uuid: Optional[str]):
+    if name:
+        return conn.execute(
+            "SELECT minecraft_uuid, minecraft_name, telegram_id, telegram_username, telegram_name, linked_at "
+            "FROM links WHERE lower(minecraft_name) = lower(?) LIMIT 1",
+            (name.strip(),),
+        ).fetchone()
+    if uuid:
+        return conn.execute(
+            "SELECT minecraft_uuid, minecraft_name, telegram_id, telegram_username, telegram_name, linked_at "
+            "FROM links WHERE minecraft_uuid = ? LIMIT 1",
+            (uuid.lower(),),
+        ).fetchone()
+    return None
+
+
+def _link_payload(row) -> dict:
+    mc_uuid, mc_name, telegram_id, telegram_username, telegram_name, linked_at = row
+    return {
+        "linked": True,
+        "minecraft_uuid": mc_uuid,
+        "minecraft_name": mc_name,
+        "telegram_id": telegram_id,
+        "telegram_username": telegram_username or "",
+        "telegram_name": telegram_name or "",
+        "linked_at": linked_at,
+    }
+
+
+async def api_lookup_name(request: web.Request) -> web.Response:
+    if request.query.get("secret") != API_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    name = request.match_info.get("name", "").strip()
+    if not name:
+        return web.json_response({"error": "missing name"}, status=400)
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = _find_link(conn, name, None)
+
+    if not row:
+        return web.json_response({"linked": False})
+
+    return web.json_response(_link_payload(row))
+
+
+async def api_unlink(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    if not json_secret_ok(data):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    name = str(data.get("name", "")).strip()
+    uuid = str(data.get("uuid", "")).lower().strip()
+    if not name and not uuid:
+        return web.json_response({"error": "missing fields"}, status=400)
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = _find_link(conn, name or None, uuid or None)
+        if not row:
+            return web.json_response({"ok": False, "error": "not_linked"}, status=404)
+
+        mc_uuid, mc_name, telegram_id, telegram_username, telegram_name, _linked_at = row
+        conn.execute("DELETE FROM links WHERE minecraft_uuid = ?", (mc_uuid,))
+        conn.execute("DELETE FROM pending_codes WHERE minecraft_uuid = ?", (mc_uuid,))
+        conn.execute("DELETE FROM login_codes WHERE minecraft_uuid = ?", (mc_uuid,))
+        conn.commit()
+
+    log.info("Unlinked %s (%s) from telegram %s", mc_name, mc_uuid, telegram_id)
+    return web.json_response(
+        {
+            "ok": True,
+            "minecraft_uuid": mc_uuid,
+            "minecraft_name": mc_name,
+            "telegram_id": telegram_id,
+            "telegram_username": telegram_username or "",
+            "telegram_name": telegram_name or "",
+        }
+    )
+
+
 async def process_auth_code(message: Message, code: str) -> None:
     if not message.from_user:
         return
@@ -376,6 +461,8 @@ async def main() -> None:
     app.router.add_post("/api/session", api_session)
     app.router.add_post("/api/login-session", api_login_session)
     app.router.add_post("/api/login-verify", api_login_verify)
+    app.router.add_get("/api/lookup/name/{name}", api_lookup_name)
+    app.router.add_post("/api/unlink", api_unlink)
 
     await start_web(app)
 
