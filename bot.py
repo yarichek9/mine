@@ -1,19 +1,27 @@
 import asyncio
-from typing import Optional
+import base64
+import io
 import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.enums import ParseMode
-from aiogram.types import Message
-
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from PIL import Image
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("telegram-auth-bot")
 
@@ -26,6 +34,7 @@ CODE_TTL_MINUTES = int(os.environ.get("CODE_TTL_MINUTES", "10"))
 LOGIN_CODE_TTL_MINUTES = int(os.environ.get("LOGIN_CODE_TTL_MINUTES", "5"))
 
 CODE_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{4,8}$")
+ALLOWED_SKIN_SIZES = {(64, 32), (64, 64), (128, 64), (128, 128)}
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -88,6 +97,27 @@ def migrate_db(conn: sqlite3.Connection) -> None:
                 minecraft_uuid TEXT PRIMARY KEY,
                 code TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            )
+            """
+        )
+    if "custom_skins" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE custom_skins (
+                minecraft_uuid TEXT PRIMARY KEY,
+                minecraft_name TEXT NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                skin_png_base64 TEXT NOT NULL,
+                updated_ms INTEGER NOT NULL
+            )
+            """
+        )
+    if "skin_upload_wait" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE skin_upload_wait (
+                telegram_id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL
             )
             """
         )
@@ -324,6 +354,221 @@ async def api_unlink(request: web.Request) -> web.Response:
     )
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎨 Сменить скин", callback_data="skin_change")],
+        ]
+    )
+
+
+def get_link_by_telegram(conn: sqlite3.Connection, telegram_id: int):
+    return conn.execute(
+        "SELECT minecraft_uuid, minecraft_name FROM links WHERE telegram_id = ? LIMIT 1",
+        (telegram_id,),
+    ).fetchone()
+
+
+def set_skin_wait(conn: sqlite3.Connection, telegram_id: int) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO skin_upload_wait (telegram_id, started_at) VALUES (?, ?)",
+        (telegram_id, utcnow().isoformat()),
+    )
+
+
+def clear_skin_wait(conn: sqlite3.Connection, telegram_id: int) -> None:
+    conn.execute("DELETE FROM skin_upload_wait WHERE telegram_id = ?", (telegram_id,))
+
+
+def is_skin_wait(conn: sqlite3.Connection, telegram_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM skin_upload_wait WHERE telegram_id = ? LIMIT 1",
+        (telegram_id,),
+    ).fetchone()
+    return row is not None
+
+
+def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+    except Exception:
+        return None, "Не удалось прочитать изображение. Отправьте PNG-файл скина."
+
+    width, height = image.size
+    if (width, height) not in ALLOWED_SKIN_SIZES:
+        allowed = ", ".join(f"{w}x{h}" for w, h in sorted(ALLOWED_SKIN_SIZES))
+        return None, f"Неверный размер {width}x{height}. Нужен один из: {allowed}."
+
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return encoded, None
+
+
+async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
+    if not message.from_user:
+        return
+
+    telegram_id = message.from_user.id
+    encoded, error = process_skin_png(raw_bytes)
+    if error:
+        await message.answer(error, parse_mode=ParseMode.HTML)
+        return
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        if not is_skin_wait(conn, telegram_id):
+            return
+
+        link = get_link_by_telegram(conn, telegram_id)
+        if not link:
+            clear_skin_wait(conn, telegram_id)
+            conn.commit()
+            await message.answer(
+                "❌ <b>Аккаунт не привязан</b>\n\nСначала авторизуйтесь на сервере.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        mc_uuid, mc_name = link
+        updated_ms = int(time.time() * 1000)
+        conn.execute(
+            "INSERT INTO custom_skins (minecraft_uuid, minecraft_name, telegram_id, skin_png_base64, updated_ms) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
+            "minecraft_name=excluded.minecraft_name, "
+            "telegram_id=excluded.telegram_id, "
+            "skin_png_base64=excluded.skin_png_base64, "
+            "updated_ms=excluded.updated_ms",
+            (mc_uuid, mc_name, telegram_id, encoded, updated_ms),
+        )
+        clear_skin_wait(conn, telegram_id)
+        conn.commit()
+
+    await message.answer(
+        "✅ <b>Скин сохранён!</b>\n\n"
+        f"🎮 Игрок: <code>{mc_name}</code>\n"
+        "Если вы на сервере — скин обновится через несколько секунд.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+    log.info("Skin updated for %s (%s) via telegram %s", mc_name, mc_uuid, telegram_id)
+
+
+async def api_skin_get(request: web.Request) -> web.Response:
+    if request.query.get("secret") != API_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    uuid = request.match_info.get("uuid", "").lower().strip()
+    if not uuid:
+        return web.json_response({"error": "missing uuid"}, status=400)
+
+    try:
+        since = int(request.query.get("since", "0"))
+    except ValueError:
+        since = 0
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT skin_png_base64, updated_ms, minecraft_name FROM custom_skins WHERE minecraft_uuid = ?",
+            (uuid,),
+        ).fetchone()
+
+    if not row:
+        return web.json_response({"pending": False})
+
+    skin_png_base64, updated_ms, minecraft_name = row
+    if updated_ms <= since:
+        return web.json_response({"pending": False})
+
+    return web.json_response(
+        {
+            "pending": True,
+            "updated_ms": updated_ms,
+            "minecraft_name": minecraft_name,
+            "skin_png_base64": skin_png_base64,
+        }
+    )
+
+
+async def on_skin_button(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    telegram_id = callback.from_user.id
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        link = get_link_by_telegram(conn, telegram_id)
+        if not link:
+            await callback.answer("Сначала привяжите аккаунт на сервере.", show_alert=True)
+            return
+        _mc_uuid, mc_name = link
+        set_skin_wait(conn, telegram_id)
+        conn.commit()
+
+    await callback.answer()
+    await callback.message.answer(
+        "🎨 <b>Смена скина</b>\n\n"
+        f"🎮 Аккаунт: <code>{mc_name}</code>\n\n"
+        "Отправьте <b>PNG-файл</b> скина одним из способов:\n"
+        "• как <b>фото</b> (без сжатия — лучше файлом)\n"
+        "• как <b>документ</b> .png\n\n"
+        "Размер: <code>64x64</code> или <code>64x32</code>\n"
+        "<i>Стандартный формат Minecraft Bedrock.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.callback_query(F.data == "skin_change")
+async def callback_skin_change(callback: CallbackQuery) -> None:
+    await on_skin_button(callback)
+
+
+@dp.message(F.photo)
+async def on_photo(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        if not is_skin_wait(conn, message.from_user.id):
+            return
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    if not file.file_path:
+        await message.answer("❌ Не удалось скачать фото. Попробуйте отправить PNG как документ.")
+        return
+
+    downloaded = await bot.download_file(file.file_path)
+    raw_bytes = downloaded.read()
+    await save_skin_upload(message, raw_bytes)
+
+
+@dp.message(F.document)
+async def on_document(message: Message) -> None:
+    if not message.from_user or not message.document:
+        return
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        if not is_skin_wait(conn, message.from_user.id):
+            return
+
+    document = message.document
+    file_name = (document.file_name or "").lower()
+    mime = (document.mime_type or "").lower()
+    if not (file_name.endswith(".png") or mime == "image/png"):
+        await message.answer("❌ Нужен PNG-файл скина (.png).")
+        return
+
+    file = await bot.get_file(document.file_id)
+    if not file.file_path:
+        await message.answer("❌ Не удалось скачать файл.")
+        return
+
+    downloaded = await bot.download_file(file.file_path)
+    raw_bytes = downloaded.read()
+    await save_skin_upload(message, raw_bytes)
+
+
 async def process_auth_code(message: Message, code: str) -> None:
     if not message.from_user:
         return
@@ -407,6 +652,7 @@ async def process_auth_code(message: Message, code: str) -> None:
         "Вернитесь в Minecraft — доступ откроется автоматически.\n"
         "Приятной игры! ⛏️",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
     )
     log.info(
         "Linked %s (%s) to telegram %s (@%s)",
@@ -421,6 +667,19 @@ async def cmd_start(message: Message) -> None:
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            link = get_link_by_telegram(conn, message.from_user.id)
+        if link:
+            _mc_uuid, mc_name = link
+            await message.answer(
+                "🎮 <b>Меню Minecraft</b>\n\n"
+                f"Аккаунт: <code>{mc_name}</code>\n\n"
+                "Выберите действие:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
         await message.answer(
             "🎮 <b>Авторизация Minecraft</b>\n\n"
             "Зайдите на сервер — в чате появится ссылка или код для привязки.\n"
@@ -463,6 +722,7 @@ async def main() -> None:
     app.router.add_post("/api/login-verify", api_login_verify)
     app.router.add_get("/api/lookup/name/{name}", api_lookup_name)
     app.router.add_post("/api/unlink", api_unlink)
+    app.router.add_get("/api/skin/{uuid}", api_skin_get)
 
     await start_web(app)
 
