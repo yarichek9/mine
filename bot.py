@@ -123,6 +123,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             )
             """
         )
+    if "custom_skins" in tables:
+        skin_cols = {row[1] for row in conn.execute("PRAGMA table_info(custom_skins)")}
+        if "skin_rgba_base64" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN skin_rgba_base64 TEXT")
 
 
 def json_secret_ok(data: dict) -> bool:
@@ -399,26 +403,42 @@ def is_skin_wait(conn: sqlite3.Connection, telegram_id: int) -> bool:
     return row is not None
 
 
-def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
+def png_to_legacy_rgba(image: Image.Image) -> bytes:
+    width, height = image.size
+    out = bytearray(width * height * 4)
+    index = 0
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, alpha = image.getpixel((x, y))
+            out[index] = red
+            out[index + 1] = green
+            out[index + 2] = blue
+            out[index + 3] = alpha
+            index += 4
+    return bytes(out)
+
+
+def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     try:
         image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
     except Exception:
-        return None, "Не удалось прочитать изображение. Отправьте PNG-файл скина."
+        return None, None, "Не удалось прочитать изображение. Отправьте PNG-файл скина."
 
     width, height = image.size
     if (width, height) not in ALLOWED_SKIN_SIZES:
         allowed = ", ".join(f"{w}x{h}" for w, h in sorted(ALLOWED_SKIN_SIZES))
-        return None, f"Неверный размер {width}x{height}. Нужен один из: {allowed}."
+        return None, None, f"Неверный размер {width}x{height}. Нужен один из: {allowed}."
 
     if (width, height) == (64, 32):
         canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         canvas.paste(image, (0, 0))
         image = canvas
 
+    rgba_b64 = base64.b64encode(png_to_legacy_rgba(image)).decode("ascii")
     output = io.BytesIO()
     image.save(output, format="PNG")
-    encoded = base64.b64encode(output.getvalue()).decode("ascii")
-    return encoded, None
+    png_b64 = base64.b64encode(output.getvalue()).decode("ascii")
+    return png_b64, rgba_b64, None
 
 
 async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
@@ -426,7 +446,7 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
         return
 
     telegram_id = message.from_user.id
-    encoded, error = process_skin_png(raw_bytes)
+    png_b64, rgba_b64, error = process_skin_png(raw_bytes)
     if error:
         await message.answer(error, parse_mode=ParseMode.HTML)
         return
@@ -448,14 +468,15 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
         mc_uuid, mc_name = link
         updated_ms = int(time.time() * 1000)
         conn.execute(
-            "INSERT INTO custom_skins (minecraft_uuid, minecraft_name, telegram_id, skin_png_base64, updated_ms) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO custom_skins (minecraft_uuid, minecraft_name, telegram_id, skin_png_base64, skin_rgba_base64, updated_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
             "minecraft_name=excluded.minecraft_name, "
             "telegram_id=excluded.telegram_id, "
             "skin_png_base64=excluded.skin_png_base64, "
+            "skin_rgba_base64=excluded.skin_rgba_base64, "
             "updated_ms=excluded.updated_ms",
-            (mc_uuid, mc_name, telegram_id, encoded, updated_ms),
+            (mc_uuid, mc_name, telegram_id, png_b64, rgba_b64, updated_ms),
         )
         clear_skin_wait(conn, telegram_id)
         conn.commit()
@@ -485,25 +506,26 @@ async def api_skin_get(request: web.Request) -> web.Response:
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT skin_png_base64, updated_ms, minecraft_name FROM custom_skins WHERE minecraft_uuid = ?",
+            "SELECT skin_png_base64, skin_rgba_base64, updated_ms, minecraft_name FROM custom_skins WHERE minecraft_uuid = ?",
             (uuid,),
         ).fetchone()
 
     if not row:
         return web.json_response({"pending": False})
 
-    skin_png_base64, updated_ms, minecraft_name = row
+    skin_png_base64, skin_rgba_base64, updated_ms, minecraft_name = row
     if updated_ms <= since:
         return web.json_response({"pending": False})
 
-    return web.json_response(
-        {
-            "pending": True,
-            "updated_ms": updated_ms,
-            "minecraft_name": minecraft_name,
-            "skin_png_base64": skin_png_base64,
-        }
-    )
+    payload = {
+        "pending": True,
+        "updated_ms": updated_ms,
+        "minecraft_name": minecraft_name,
+        "skin_png_base64": skin_png_base64,
+    }
+    if skin_rgba_base64:
+        payload["skin_rgba_base64"] = skin_rgba_base64
+    return web.json_response(payload)
 
 
 async def start_skin_upload(message: Message) -> None:
@@ -528,9 +550,12 @@ async def start_skin_upload(message: Message) -> None:
         "🎨 <b>Смена скина</b>\n\n"
         f"🎮 Аккаунт: <code>{mc_name}</code>\n\n"
         "Отправьте <b>PNG-файл</b> скина как <b>документ</b> (скрепка → Файл → .png).\n"
-        "<b>Не отправляйте как фото</b> — Telegram сжимает картинку и скин ломается.\n\n"
-        "Размер: <code>64x64</code> или <code>64x32</code>\n"
-        "<i>Стандартный шаблон Minecraft Bedrock.</i>",
+        "<b>Не отправляйте как фото</b> — Telegram сжимает картинку.\n\n"
+        "Размер: <code>64×64</code> (лучше) или <code>64×32</code>.\n"
+        "Нужен шаблон <b>Minecraft Bedrock</b>, не Java с NameMC.\n"
+        "Тип рук должен совпадать с персонажем в игре:\n"
+        "• <b>Steve</b> — широкие руки\n"
+        "• <b>Alex</b> — узкие (slim) руки",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(),
     )
