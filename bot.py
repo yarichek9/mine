@@ -13,13 +13,14 @@ from typing import Optional, Tuple
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.enums import ParseMode
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    BotCommand,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from PIL import Image
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -35,6 +36,7 @@ LOGIN_CODE_TTL_MINUTES = int(os.environ.get("LOGIN_CODE_TTL_MINUTES", "5"))
 
 CODE_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{4,8}$")
 ALLOWED_SKIN_SIZES = {(64, 32), (64, 64), (128, 64), (128, 128)}
+SKIN_BUTTON_TEXT = "🎨 Сменить скин"
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -354,10 +356,19 @@ async def api_unlink(request: web.Request) -> web.Response:
     )
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎨 Сменить скин", callback_data="skin_change")],
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=SKIN_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+async def setup_bot_commands() -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="skin", description="Сменить скин Minecraft"),
         ]
     )
 
@@ -398,6 +409,11 @@ def process_skin_png(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
     if (width, height) not in ALLOWED_SKIN_SIZES:
         allowed = ", ".join(f"{w}x{h}" for w, h in sorted(ALLOWED_SKIN_SIZES))
         return None, f"Неверный размер {width}x{height}. Нужен один из: {allowed}."
+
+    if (width, height) == (64, 32):
+        canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        canvas.paste(image, (0, 0))
+        image = canvas
 
     output = io.BytesIO()
     image.save(output, format="PNG")
@@ -490,37 +506,44 @@ async def api_skin_get(request: web.Request) -> web.Response:
     )
 
 
-async def on_skin_button(callback: CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        await callback.answer()
+async def start_skin_upload(message: Message) -> None:
+    if not message.from_user:
         return
 
-    telegram_id = callback.from_user.id
+    telegram_id = message.from_user.id
     with closing(sqlite3.connect(DB_PATH)) as conn:
         link = get_link_by_telegram(conn, telegram_id)
         if not link:
-            await callback.answer("Сначала привяжите аккаунт на сервере.", show_alert=True)
+            await message.answer(
+                "❌ <b>Аккаунт не привязан</b>\n\nСначала авторизуйтесь на сервере.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
         _mc_uuid, mc_name = link
         set_skin_wait(conn, telegram_id)
         conn.commit()
 
-    await callback.answer()
-    await callback.message.answer(
+    await message.answer(
         "🎨 <b>Смена скина</b>\n\n"
         f"🎮 Аккаунт: <code>{mc_name}</code>\n\n"
-        "Отправьте <b>PNG-файл</b> скина одним из способов:\n"
-        "• как <b>фото</b> (без сжатия — лучше файлом)\n"
-        "• как <b>документ</b> .png\n\n"
+        "Отправьте <b>PNG-файл</b> скина как <b>документ</b> (скрепка → Файл → .png).\n"
+        "<b>Не отправляйте как фото</b> — Telegram сжимает картинку и скин ломается.\n\n"
         "Размер: <code>64x64</code> или <code>64x32</code>\n"
-        "<i>Стандартный формат Minecraft Bedrock.</i>",
+        "<i>Стандартный шаблон Minecraft Bedrock.</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
     )
 
 
-@dp.callback_query(F.data == "skin_change")
-async def callback_skin_change(callback: CallbackQuery) -> None:
-    await on_skin_button(callback)
+@dp.message(Command("skin"))
+async def cmd_skin(message: Message) -> None:
+    await start_skin_upload(message)
+
+
+@dp.message(F.text == SKIN_BUTTON_TEXT)
+async def on_skin_button_text(message: Message) -> None:
+    await start_skin_upload(message)
 
 
 @dp.message(F.photo)
@@ -532,15 +555,12 @@ async def on_photo(message: Message) -> None:
         if not is_skin_wait(conn, message.from_user.id):
             return
 
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    if not file.file_path:
-        await message.answer("❌ Не удалось скачать фото. Попробуйте отправить PNG как документ.")
-        return
-
-    downloaded = await bot.download_file(file.file_path)
-    raw_bytes = downloaded.read()
-    await save_skin_upload(message, raw_bytes)
+    await message.answer(
+        "❌ <b>Не отправляйте скин как фото</b>\n\n"
+        "Telegram сжимает фото и текстура ломается.\n"
+        "Отправьте PNG как <b>документ</b>: скрепка → Файл → выберите .png",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.message(F.document)
@@ -686,6 +706,7 @@ async def cmd_start(message: Message) -> None:
             "Отправьте код сюда в чат или нажмите ссылку из игры.\n\n"
             "<i>Один Telegram = один игровой аккаунт.</i>",
             parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -725,6 +746,7 @@ async def main() -> None:
     app.router.add_get("/api/skin/{uuid}", api_skin_get)
 
     await start_web(app)
+    await setup_bot_commands()
 
     if not BOT_USERNAME:
         me = await bot.get_me()
