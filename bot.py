@@ -575,6 +575,21 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
 
         png_bytes = base64.b64decode(png_b64)
         updated_ms = int(time.time() * 1000)
+
+        save_custom_skin(
+            conn,
+            mc_uuid,
+            mc_name,
+            telegram_id,
+            png_b64,
+            rgba_b64,
+            None,
+            None,
+            updated_ms,
+        )
+        clear_skin_wait(conn, telegram_id)
+        conn.commit()
+
         texture_value, texture_signature, sign_error = await sign_skin_png(
             png_bytes, mc_uuid, updated_ms
         )
@@ -586,22 +601,13 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
                 "Попробуйте другой PNG или повторите через минуту.",
                 parse_mode=ParseMode.HTML,
             )
-            clear_skin_wait(conn, telegram_id)
-            conn.commit()
             return
 
-        save_custom_skin(
-            conn,
-            mc_uuid,
-            mc_name,
-            telegram_id,
-            png_b64,
-            rgba_b64,
-            texture_value,
-            texture_signature,
-            updated_ms,
+        conn.execute(
+            "UPDATE custom_skins SET texture_value = ?, texture_signature = ? "
+            "WHERE minecraft_uuid = ?",
+            (texture_value, texture_signature, mc_uuid),
         )
-        clear_skin_wait(conn, telegram_id)
         conn.commit()
 
     await message.answer(

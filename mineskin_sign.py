@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -8,55 +10,147 @@ import aiohttp
 
 log = logging.getLogger("telegram-auth-bot")
 
+PUBLIC_BASE_URL = (
+    os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+).rstrip("/")
 MINESKIN_UPLOAD_URL = os.environ.get(
     "MINESKIN_UPLOAD_URL", "https://api.mineskin.org/generate/upload"
+)
+MINESKIN_URL_ENDPOINT = os.environ.get(
+    "MINESKIN_URL_ENDPOINT", "https://api.mineskin.org/generate/url"
 )
 MINESKIN_USER_AGENT = os.environ.get("MINESKIN_USER_AGENT", "TelegramAuthBot/1.0")
 MINESKIN_TIMEOUT_SEC = int(os.environ.get("MINESKIN_TIMEOUT_SEC", "120"))
 
 
-def build_skin_name(mc_uuid: str, updated_ms: int) -> str:
-    compact = mc_uuid.replace("-", "").lower()[:20]
-    return f"tg-{compact}-{updated_ms}"
+def build_skin_name(mc_uuid: str, updated_ms: int, png_bytes: Optional[bytes] = None) -> str:
+    compact = mc_uuid.replace("-", "").lower()[:16]
+    suffix = ""
+    if png_bytes:
+        suffix = "-" + hashlib.sha256(png_bytes).hexdigest()[:10]
+    return f"tg-{compact}-{updated_ms}{suffix}"
 
 
 async def sign_skin_png(
     png_bytes: bytes, mc_uuid: str, updated_ms: int
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    skin_name = build_skin_name(mc_uuid, updated_ms)
-    body, error = await _upload(png_bytes, skin_name)
+    """Sign skin after PNG is saved on bot API (URL method uses hosted texture.png)."""
+    if PUBLIC_BASE_URL:
+        value, signature, error = await _sign_from_url(mc_uuid, updated_ms, png_bytes)
+        if value and signature:
+            if _texture_looks_valid(value):
+                return value, signature, None
+            error = error or "подпись не содержит textures.minecraft.net"
+        log.warning("MineSkin URL sign for %s failed (%s), trying upload", mc_uuid, error)
+    else:
+        log.warning("PUBLIC_BASE_URL / RENDER_EXTERNAL_URL not set — using MineSkin upload")
+
+    return await _sign_from_upload(png_bytes, mc_uuid, updated_ms)
+
+
+async def _sign_from_url(
+    mc_uuid: str, updated_ms: int, png_bytes: bytes
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    fp = hashlib.sha256(png_bytes).hexdigest()[:12]
+    skin_url = (
+        f"{PUBLIC_BASE_URL}/api/skin/{mc_uuid.lower()}/texture.png"
+        f"?v={updated_ms}&h={fp}"
+    )
+    skin_name = build_skin_name(mc_uuid, updated_ms, png_bytes)
+    body, error = await _post_form(
+        MINESKIN_URL_ENDPOINT,
+        {
+            "url": skin_url,
+            "visibility": "1",
+            "name": skin_name,
+            "model": "",
+        },
+    )
+    if error:
+        return None, None, error
+
+    if _is_duplicate(body):
+        body, error = await _post_form(
+            MINESKIN_URL_ENDPOINT,
+            {
+                "url": skin_url + "&retry=1",
+                "visibility": "1",
+                "name": f"{skin_name}-r1",
+                "model": "",
+            },
+        )
+        if error:
+            return None, None, error
+
+    value, signature = _parse_texture(body)
+    if value and signature and _texture_looks_valid(value):
+        return value, signature, None
+    return None, None, "MineSkin URL: не удалось получить подписанную текстуру"
+
+
+async def _sign_from_upload(
+    png_bytes: bytes, mc_uuid: str, updated_ms: int
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    skin_name = build_skin_name(mc_uuid, updated_ms, png_bytes)
+    body, error = await _upload_bytes(png_bytes, skin_name)
     if error:
         return None, None, error
 
     value, signature = _parse_texture(body)
-    if value and signature:
+    if value and signature and _texture_looks_valid(value):
         return value, signature, None
 
     if _is_duplicate(body):
-        log.warning("MineSkin duplicate for %s, retrying with unique name", skin_name)
-        body, error = await _upload(png_bytes, f"{skin_name}-r{updated_ms}")
+        log.warning("MineSkin upload duplicate for %s, retrying", skin_name)
+        body, error = await _upload_bytes(png_bytes, f"{skin_name}-u2")
         if error:
             return None, None, error
         value, signature = _parse_texture(body)
-        if value and signature:
+        if value and signature and _texture_looks_valid(value):
             return value, signature, None
 
-    return None, None, "MineSkin: не удалось получить подписанную текстуру"
+    return None, None, "MineSkin upload: не удалось получить подписанную текстуру"
 
 
-async def _upload(png_bytes: bytes, skin_name: str) -> Tuple[Optional[str], Optional[str]]:
+async def _post_form(
+    endpoint: str, fields: Dict[str, str]
+) -> Tuple[Optional[str], Optional[str]]:
     form = aiohttp.FormData()
-    form.add_field("file", png_bytes, filename="skin.png", content_type="image/png")
-    form.add_field("visibility", "1")
-    form.add_field("name", skin_name)
-    form.add_field("model", "")
+    for key, value in fields.items():
+        form.add_field(key, value)
 
     timeout = aiohttp.ClientTimeout(total=MINESKIN_TIMEOUT_SEC)
     headers = {"User-Agent": MINESKIN_USER_AGENT, "Accept": "application/json"}
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(MINESKIN_UPLOAD_URL, data=form, headers=headers) as resp:
+            async with session.post(endpoint, data=form, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status < 200 or resp.status >= 300:
+                    return None, f"MineSkin HTTP {resp.status}: {text[:200]}"
+                return text, None
+    except aiohttp.ClientError as exc:
+        return None, f"MineSkin недоступен: {exc}"
+
+
+async def _upload_bytes(png_bytes: bytes, skin_name: str) -> Tuple[Optional[str], Optional[str]]:
+    form = aiohttp.FormData()
+    form.add_field("file", png_bytes, filename="skin.png", content_type="image/png")
+    form.add_field("visibility", "1")
+    form.add_field("name", skin_name)
+    form.add_field("model", "")
+    return await _post_multipart(MINESKIN_UPLOAD_URL, form)
+
+
+async def _post_multipart(
+    endpoint: str, form: aiohttp.FormData
+) -> Tuple[Optional[str], Optional[str]]:
+    timeout = aiohttp.ClientTimeout(total=MINESKIN_TIMEOUT_SEC)
+    headers = {"User-Agent": MINESKIN_USER_AGENT, "Accept": "application/json"}
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(endpoint, data=form, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status < 200 or resp.status >= 300:
                     return None, f"MineSkin HTTP {resp.status}: {text[:200]}"
@@ -116,7 +210,7 @@ def _parse_texture_regex(json_text: str) -> Tuple[Optional[str], Optional[str]]:
     signatures = re.findall(r'"signature"\s*:\s*"([^"]+)"', block)
 
     for value in values:
-        if not _looks_like_texture_value(value):
+        if not _texture_looks_valid(value):
             continue
         for signature in signatures:
             if signature and len(signature) > 32:
@@ -124,12 +218,10 @@ def _parse_texture_regex(json_text: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def _looks_like_texture_value(value: str) -> bool:
+def _texture_looks_valid(value: str) -> bool:
     if not value or len(value) < 40:
         return False
     try:
-        import base64
-
         decoded = base64.b64decode(value).decode("utf-8", errors="ignore")
         return "textures.minecraft.net" in decoded
     except Exception:
