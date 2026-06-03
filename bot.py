@@ -566,6 +566,35 @@ async def api_skin_get(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+async def api_skin_texture(request: web.Request) -> web.Response:
+    uuid = request.match_info.get("uuid", "").lower().strip()
+    if not uuid:
+        return web.Response(status=404, text="missing uuid")
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT skin_png_base64 FROM custom_skins WHERE minecraft_uuid = ?",
+            (uuid,),
+        ).fetchone()
+
+    if not row or not row[0]:
+        return web.Response(status=404, text="skin not found")
+
+    try:
+        png_bytes = base64.b64decode(row[0])
+    except Exception:
+        return web.Response(status=500, text="invalid skin data")
+
+    if not png_bytes:
+        return web.Response(status=404, text="skin not found")
+
+    return web.Response(
+        body=png_bytes,
+        content_type="image/png",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 async def start_skin_upload(message: Message) -> None:
     if not message.from_user:
         return
@@ -846,6 +875,7 @@ async def main() -> None:
     app.router.add_get("/api/lookup/name/{name}", api_lookup_name)
     app.router.add_post("/api/unlink", api_unlink)
     app.router.add_get("/api/skin/{uuid}", api_skin_get)
+    app.router.add_get("/api/skin/{uuid}/texture.png", api_skin_texture)
 
     await start_web(app)
     await setup_bot_commands()
