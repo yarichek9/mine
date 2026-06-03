@@ -23,6 +23,8 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 from PIL import Image
+
+from mineskin_sign import sign_skin_png
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("telegram-auth-bot")
 
@@ -132,6 +134,14 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_skin_png_base64 TEXT")
         if "prev_skin_rgba_base64" not in skin_cols:
             conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_skin_rgba_base64 TEXT")
+        if "texture_value" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN texture_value TEXT")
+        if "texture_signature" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN texture_signature TEXT")
+        if "prev_texture_value" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_texture_value TEXT")
+        if "prev_texture_signature" not in skin_cols:
+            conn.execute("ALTER TABLE custom_skins ADD COLUMN prev_texture_signature TEXT")
 
 
 def json_secret_ok(data: dict) -> bool:
@@ -452,22 +462,40 @@ def save_custom_skin(
     telegram_id: int,
     png_b64: str,
     rgba_b64: str,
+    texture_value: Optional[str] = None,
+    texture_signature: Optional[str] = None,
+    updated_ms: Optional[int] = None,
 ) -> int:
-    updated_ms = int(time.time() * 1000)
+    if updated_ms is None:
+        updated_ms = int(time.time() * 1000)
     conn.execute(
         "INSERT INTO custom_skins ("
         "minecraft_uuid, minecraft_name, telegram_id, "
-        "skin_png_base64, skin_rgba_base64, updated_ms"
-        ") VALUES (?, ?, ?, ?, ?, ?) "
+        "skin_png_base64, skin_rgba_base64, updated_ms, "
+        "texture_value, texture_signature"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(minecraft_uuid) DO UPDATE SET "
         "minecraft_name=excluded.minecraft_name, "
         "telegram_id=excluded.telegram_id, "
         "prev_skin_png_base64=custom_skins.skin_png_base64, "
         "prev_skin_rgba_base64=custom_skins.skin_rgba_base64, "
+        "prev_texture_value=custom_skins.texture_value, "
+        "prev_texture_signature=custom_skins.texture_signature, "
         "skin_png_base64=excluded.skin_png_base64, "
         "skin_rgba_base64=excluded.skin_rgba_base64, "
+        "texture_value=excluded.texture_value, "
+        "texture_signature=excluded.texture_signature, "
         "updated_ms=excluded.updated_ms",
-        (mc_uuid, mc_name, telegram_id, png_b64, rgba_b64, updated_ms),
+        (
+            mc_uuid,
+            mc_name,
+            telegram_id,
+            png_b64,
+            rgba_b64,
+            updated_ms,
+            texture_value,
+            texture_signature,
+        ),
     )
     return updated_ms
 
@@ -475,20 +503,44 @@ def save_custom_skin(
 def restore_previous_skin(conn: sqlite3.Connection, mc_uuid: str) -> Tuple[Optional[int], Optional[str]]:
     row = conn.execute(
         "SELECT prev_skin_png_base64, prev_skin_rgba_base64, "
-        "skin_png_base64, skin_rgba_base64 "
+        "skin_png_base64, skin_rgba_base64, "
+        "prev_texture_value, prev_texture_signature, "
+        "texture_value, texture_signature "
         "FROM custom_skins WHERE minecraft_uuid = ?",
         (mc_uuid,),
     ).fetchone()
     if not row or not row[0]:
         return None, "Нет сохранённого предыдущего скина."
-    prev_png, prev_rgba, cur_png, cur_rgba = row
+    (
+        prev_png,
+        prev_rgba,
+        cur_png,
+        cur_rgba,
+        prev_value,
+        prev_signature,
+        cur_value,
+        cur_signature,
+    ) = row
     updated_ms = int(time.time() * 1000)
     conn.execute(
         "UPDATE custom_skins SET "
         "skin_png_base64=?, skin_rgba_base64=?, "
-        "prev_skin_png_base64=?, prev_skin_rgba_base64=?, updated_ms=? "
+        "texture_value=?, texture_signature=?, "
+        "prev_skin_png_base64=?, prev_skin_rgba_base64=?, "
+        "prev_texture_value=?, prev_texture_signature=?, updated_ms=? "
         "WHERE minecraft_uuid=?",
-        (prev_png, prev_rgba, cur_png, cur_rgba, updated_ms, mc_uuid),
+        (
+            prev_png,
+            prev_rgba,
+            prev_value,
+            prev_signature,
+            cur_png,
+            cur_rgba,
+            cur_value,
+            cur_signature,
+            updated_ms,
+            mc_uuid,
+        ),
     )
     return updated_ms, None
 
@@ -515,12 +567,45 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
             return
 
         mc_uuid, mc_name = link
-        save_custom_skin(conn, mc_uuid, mc_name, telegram_id, png_b64, rgba_b64)
+
+        await message.answer(
+            "⏳ <b>Подписываю скин через MineSkin…</b>\n\nПодождите 5–20 секунд.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        png_bytes = base64.b64decode(png_b64)
+        updated_ms = int(time.time() * 1000)
+        texture_value, texture_signature, sign_error = await sign_skin_png(
+            png_bytes, mc_uuid, updated_ms
+        )
+
+        if sign_error or not texture_value or not texture_signature:
+            await message.answer(
+                "❌ <b>Не удалось подписать скин</b>\n\n"
+                f"{sign_error or 'пустой ответ MineSkin'}\n\n"
+                "Попробуйте другой PNG или повторите через минуту.",
+                parse_mode=ParseMode.HTML,
+            )
+            clear_skin_wait(conn, telegram_id)
+            conn.commit()
+            return
+
+        save_custom_skin(
+            conn,
+            mc_uuid,
+            mc_name,
+            telegram_id,
+            png_b64,
+            rgba_b64,
+            texture_value,
+            texture_signature,
+            updated_ms,
+        )
         clear_skin_wait(conn, telegram_id)
         conn.commit()
 
     await message.answer(
-        "✅ <b>Скин сохранён!</b>\n\n"
+        "✅ <b>Скин сохранён и подписан!</b>\n\n"
         f"🎮 Игрок: <code>{mc_name}</code>\n"
         "Если вы на сервере — скин обновится через несколько секунд.",
         parse_mode=ParseMode.HTML,
@@ -544,14 +629,22 @@ async def api_skin_get(request: web.Request) -> web.Response:
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT skin_png_base64, skin_rgba_base64, updated_ms, minecraft_name FROM custom_skins WHERE minecraft_uuid = ?",
+            "SELECT skin_png_base64, skin_rgba_base64, updated_ms, minecraft_name, "
+            "texture_value, texture_signature FROM custom_skins WHERE minecraft_uuid = ?",
             (uuid,),
         ).fetchone()
 
     if not row:
         return web.json_response({"pending": False})
 
-    skin_png_base64, skin_rgba_base64, updated_ms, minecraft_name = row
+    (
+        skin_png_base64,
+        skin_rgba_base64,
+        updated_ms,
+        minecraft_name,
+        texture_value,
+        texture_signature,
+    ) = row
     if updated_ms <= since:
         return web.json_response({"pending": False})
 
@@ -563,6 +656,9 @@ async def api_skin_get(request: web.Request) -> web.Response:
     }
     if skin_rgba_base64:
         payload["skin_rgba_base64"] = skin_rgba_base64
+    if texture_value and texture_signature:
+        payload["texture_value"] = texture_value
+        payload["texture_signature"] = texture_signature
     return web.json_response(payload)
 
 
