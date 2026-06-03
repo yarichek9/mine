@@ -1,10 +1,11 @@
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import aiohttp
 
@@ -21,6 +22,10 @@ MINESKIN_URL_ENDPOINT = os.environ.get(
 )
 MINESKIN_USER_AGENT = os.environ.get("MINESKIN_USER_AGENT", "TelegramAuthBot/1.0")
 MINESKIN_TIMEOUT_SEC = int(os.environ.get("MINESKIN_TIMEOUT_SEC", "120"))
+MINESKIN_MAX_RETRIES = int(os.environ.get("MINESKIN_MAX_RETRIES", "8"))
+MINESKIN_RETRY_BUFFER_SEC = float(os.environ.get("MINESKIN_RETRY_BUFFER_SEC", "1.5"))
+
+_mineskin_lock = asyncio.Lock()
 
 
 def build_skin_name(mc_uuid: str, updated_ms: int, png_bytes: Optional[bytes] = None) -> str:
@@ -34,18 +39,18 @@ def build_skin_name(mc_uuid: str, updated_ms: int, png_bytes: Optional[bytes] = 
 async def sign_skin_png(
     png_bytes: bytes, mc_uuid: str, updated_ms: int
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Sign skin after PNG is saved on bot API (URL method uses hosted texture.png)."""
-    if PUBLIC_BASE_URL:
-        value, signature, error = await _sign_from_url(mc_uuid, updated_ms, png_bytes)
-        if value and signature:
-            if _texture_looks_valid(value):
+    """Sign skin after PNG is saved on bot API (serialized + retries on rate limit)."""
+    async with _mineskin_lock:
+        if PUBLIC_BASE_URL:
+            value, signature, error = await _sign_from_url(mc_uuid, updated_ms, png_bytes)
+            if value and signature:
                 return value, signature, None
-            error = error or "подпись не содержит textures.minecraft.net"
-        log.warning("MineSkin URL sign for %s failed (%s), trying upload", mc_uuid, error)
-    else:
-        log.warning("PUBLIC_BASE_URL / RENDER_EXTERNAL_URL not set — using MineSkin upload")
+            if error and _is_rate_limit_message(error):
+                return None, None, error
+            if error:
+                log.warning("MineSkin URL sign for %s failed (%s)", mc_uuid, error)
 
-    return await _sign_from_upload(png_bytes, mc_uuid, updated_ms)
+        return await _sign_from_upload(png_bytes, mc_uuid, updated_ms)
 
 
 async def _sign_from_url(
@@ -68,8 +73,7 @@ async def _sign_from_url(
     )
     if error:
         return None, None, error
-
-    if _is_duplicate(body):
+    if body and _is_duplicate(body):
         body, error = await _post_form(
             MINESKIN_URL_ENDPOINT,
             {
@@ -82,7 +86,7 @@ async def _sign_from_url(
         if error:
             return None, None, error
 
-    value, signature = _parse_texture(body)
+    value, signature = _parse_texture(body or "")
     if value and signature and _texture_looks_valid(value):
         return value, signature, None
     return None, None, "MineSkin URL: не удалось получить подписанную текстуру"
@@ -96,16 +100,16 @@ async def _sign_from_upload(
     if error:
         return None, None, error
 
-    value, signature = _parse_texture(body)
+    value, signature = _parse_texture(body or "")
     if value and signature and _texture_looks_valid(value):
         return value, signature, None
 
-    if _is_duplicate(body):
+    if body and _is_duplicate(body):
         log.warning("MineSkin upload duplicate for %s, retrying", skin_name)
         body, error = await _upload_bytes(png_bytes, f"{skin_name}-u2")
         if error:
             return None, None, error
-        value, signature = _parse_texture(body)
+        value, signature = _parse_texture(body or "")
         if value and signature and _texture_looks_valid(value):
             return value, signature, None
 
@@ -115,48 +119,95 @@ async def _sign_from_upload(
 async def _post_form(
     endpoint: str, fields: Dict[str, str]
 ) -> Tuple[Optional[str], Optional[str]]:
-    form = aiohttp.FormData()
-    for key, value in fields.items():
-        form.add_field(key, value)
+    def build_form() -> aiohttp.FormData:
+        form = aiohttp.FormData()
+        for key, value in fields.items():
+            form.add_field(key, value)
+        return form
 
-    timeout = aiohttp.ClientTimeout(total=MINESKIN_TIMEOUT_SEC)
-    headers = {"User-Agent": MINESKIN_USER_AGENT, "Accept": "application/json"}
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, data=form, headers=headers) as resp:
-                text = await resp.text()
-                if resp.status < 200 or resp.status >= 300:
-                    return None, f"MineSkin HTTP {resp.status}: {text[:200]}"
-                return text, None
-    except aiohttp.ClientError as exc:
-        return None, f"MineSkin недоступен: {exc}"
+    return await _mineskin_request(endpoint, build_form)
 
 
 async def _upload_bytes(png_bytes: bytes, skin_name: str) -> Tuple[Optional[str], Optional[str]]:
-    form = aiohttp.FormData()
-    form.add_field("file", png_bytes, filename="skin.png", content_type="image/png")
-    form.add_field("visibility", "1")
-    form.add_field("name", skin_name)
-    form.add_field("model", "")
-    return await _post_multipart(MINESKIN_UPLOAD_URL, form)
+    def build_form() -> aiohttp.FormData:
+        form = aiohttp.FormData()
+        form.add_field("file", png_bytes, filename="skin.png", content_type="image/png")
+        form.add_field("visibility", "1")
+        form.add_field("name", skin_name)
+        form.add_field("model", "")
+        return form
+
+    return await _mineskin_request(MINESKIN_UPLOAD_URL, build_form)
 
 
-async def _post_multipart(
-    endpoint: str, form: aiohttp.FormData
+async def _mineskin_request(
+    endpoint: str, build_form: Callable[[], aiohttp.FormData]
 ) -> Tuple[Optional[str], Optional[str]]:
     timeout = aiohttp.ClientTimeout(total=MINESKIN_TIMEOUT_SEC)
     headers = {"User-Agent": MINESKIN_USER_AGENT, "Accept": "application/json"}
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, data=form, headers=headers) as resp:
-                text = await resp.text()
-                if resp.status < 200 or resp.status >= 300:
-                    return None, f"MineSkin HTTP {resp.status}: {text[:200]}"
-                return text, None
+            for attempt in range(1, MINESKIN_MAX_RETRIES + 1):
+                async with session.post(endpoint, data=build_form(), headers=headers) as resp:
+                    text = await resp.text()
+                    if resp.status in (429, 503):
+                        delay = _retry_delay_seconds(text, resp.headers)
+                        log.info(
+                            "MineSkin rate limit HTTP %s, attempt %s/%s, wait %.1fs",
+                            resp.status,
+                            attempt,
+                            MINESKIN_MAX_RETRIES,
+                            delay,
+                        )
+                        if attempt >= MINESKIN_MAX_RETRIES:
+                            return None, _rate_limit_user_message(resp.status)
+                        await asyncio.sleep(delay)
+                        continue
+                    if resp.status < 200 or resp.status >= 300:
+                        return None, f"MineSkin HTTP {resp.status}: {text[:200]}"
+                    return text, None
     except aiohttp.ClientError as exc:
         return None, f"MineSkin недоступен: {exc}"
+
+    return None, _rate_limit_user_message(429)
+
+
+def _retry_delay_seconds(body: str, headers: Any) -> float:
+    try:
+        data = json.loads(body)
+        delay_info = data.get("delayInfo")
+        if isinstance(delay_info, dict):
+            millis = delay_info.get("millis")
+            if millis is not None:
+                return max(float(millis) / 1000.0, 1.0) + MINESKIN_RETRY_BUFFER_SEC
+            seconds = delay_info.get("seconds")
+            if seconds is not None:
+                return max(float(seconds), 1.0) + MINESKIN_RETRY_BUFFER_SEC
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    retry_after = None
+    if hasattr(headers, "get"):
+        retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), 1.0) + MINESKIN_RETRY_BUFFER_SEC
+        except ValueError:
+            pass
+
+    return 6.0 + MINESKIN_RETRY_BUFFER_SEC
+
+
+def _rate_limit_user_message(status: int) -> str:
+    return (
+        f"MineSkin временно ограничил запросы (HTTP {status}). "
+        "Бот уже ждал повтор — попробуйте загрузить скин ещё раз через 1–2 минуты."
+    )
+
+
+def _is_rate_limit_message(error: str) -> bool:
+    return "429" in error or "503" in error or "ограничил запросы" in error
 
 
 def _parse_texture(json_text: str) -> Tuple[Optional[str], Optional[str]]:

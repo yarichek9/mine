@@ -569,7 +569,8 @@ async def save_skin_upload(message: Message, raw_bytes: bytes) -> None:
         mc_uuid, mc_name = link
 
         await message.answer(
-            "⏳ <b>Подписываю скин через MineSkin…</b>\n\nПодождите 5–20 секунд.",
+            "⏳ <b>Подписываю скин через MineSkin…</b>\n\n"
+            "Обычно 10–30 сек. При лимите API бот подождёт и повторит сам.",
             parse_mode=ParseMode.HTML,
         )
 
