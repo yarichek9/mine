@@ -1,13 +1,15 @@
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
+from PIL import Image
 
 log = logging.getLogger("telegram-auth-bot")
 
@@ -41,16 +43,33 @@ async def sign_skin_png(
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Sign skin after PNG is saved on bot API (serialized + retries on rate limit)."""
     async with _mineskin_lock:
+        attempts: List[Tuple[str, Any]] = []
         if PUBLIC_BASE_URL:
-            value, signature, error = await _sign_from_url(mc_uuid, updated_ms, png_bytes)
-            if value and signature:
-                return value, signature, None
+            attempts.append(("url", _sign_from_url))
+        attempts.append(("upload", _sign_from_upload))
+
+        last_error: Optional[str] = None
+        for label, signer in attempts:
+            if signer is _sign_from_url:
+                value, signature, error = await signer(mc_uuid, updated_ms, png_bytes)
+            else:
+                value, signature, error = await signer(png_bytes, mc_uuid, updated_ms)
+
             if error and _is_rate_limit_message(error):
                 return None, None, error
             if error:
-                log.warning("MineSkin URL sign for %s failed (%s)", mc_uuid, error)
+                last_error = error
+                log.warning("MineSkin %s sign for %s: %s", label, mc_uuid, error)
+                continue
+            if not value or not signature:
+                last_error = f"MineSkin {label}: пустая подпись"
+                continue
+            if await _verify_signed_matches_png(value, png_bytes):
+                return value, signature, None
+            log.warning("MineSkin %s returned wrong skin for %s, trying next method", label, mc_uuid)
+            last_error = "MineSkin подписал чужой скин (кэш), повторите загрузку"
 
-        return await _sign_from_upload(png_bytes, mc_uuid, updated_ms)
+        return None, None, last_error or "Не удалось подписать скин"
 
 
 async def _sign_from_url(
@@ -73,7 +92,7 @@ async def _sign_from_url(
     )
     if error:
         return None, None, error
-    if body and _is_duplicate(body):
+    if body and _is_duplicate(body) and not _parse_texture(body or "")[0]:
         body, error = await _post_form(
             MINESKIN_URL_ENDPOINT,
             {
@@ -104,7 +123,7 @@ async def _sign_from_upload(
     if value and signature and _texture_looks_valid(value):
         return value, signature, None
 
-    if body and _is_duplicate(body):
+    if body and _is_duplicate(body) and not (value and signature):
         log.warning("MineSkin upload duplicate for %s, retrying", skin_name)
         body, error = await _upload_bytes(png_bytes, f"{skin_name}-u2")
         if error:
@@ -281,3 +300,32 @@ def _texture_looks_valid(value: str) -> bool:
 
 def _is_duplicate(json_text: str) -> bool:
     return '"duplicate":true' in json_text or '"duplicate": true' in json_text
+
+
+async def _verify_signed_matches_png(texture_value: str, png_bytes: bytes) -> bool:
+    try:
+        decoded = json.loads(base64.b64decode(texture_value).decode("utf-8"))
+        skin_url = decoded.get("textures", {}).get("SKIN", {}).get("url")
+        if not skin_url:
+            return False
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(skin_url) as resp:
+                if resp.status != 200:
+                    return False
+                remote_png = await resp.read()
+        return _png_pixels_equal(png_bytes, remote_png)
+    except Exception as exc:
+        log.warning("Skin verify failed: %s", exc)
+        return False
+
+
+def _png_pixels_equal(expected: bytes, actual: bytes) -> bool:
+    try:
+        a = Image.open(io.BytesIO(expected)).convert("RGBA")
+        b = Image.open(io.BytesIO(actual)).convert("RGBA")
+        if a.size != b.size:
+            b = b.resize(a.size, Image.Resampling.NEAREST)
+        return list(a.getdata()) == list(b.getdata())
+    except Exception:
+        return hashlib.sha256(expected).digest() == hashlib.sha256(actual).digest()

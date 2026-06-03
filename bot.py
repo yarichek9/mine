@@ -655,17 +655,16 @@ async def api_skin_get(request: web.Request) -> web.Response:
     if updated_ms <= since:
         return web.json_response({"pending": False})
 
+    if not texture_value or not texture_signature:
+        return web.json_response({"pending": False})
+
     payload = {
         "pending": True,
         "updated_ms": updated_ms,
         "minecraft_name": minecraft_name,
-        "skin_png_base64": skin_png_base64,
+        "texture_value": texture_value,
+        "texture_signature": texture_signature,
     }
-    if skin_rgba_base64:
-        payload["skin_rgba_base64"] = skin_rgba_base64
-    if texture_value and texture_signature:
-        payload["texture_value"] = texture_value
-        payload["texture_signature"] = texture_signature
     return web.json_response(payload)
 
 
